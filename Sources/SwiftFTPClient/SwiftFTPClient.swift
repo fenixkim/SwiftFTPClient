@@ -48,9 +48,9 @@ public class FTPClient {
         self.progress = progress
         self.bufferSize = bufferSize
     }
-    
+
     // MARK: - Public Methods
-    
+
     /// Uploads multiple files to the FTP server.
     /// - Parameters:
     ///   - files: An array of `FTPUploadable` items to be uploaded.
@@ -72,59 +72,59 @@ public class FTPClient {
             }
         }
     }
-    
+
     /// Cancels any ongoing transfer operations.
     public func cancel() {
         isCancelled = true
         controlConnection?.cancel()
     }
-    
+
     // MARK: - Private Methods
-    
+
     public func upload(
         files: [FTPUploadable],
         progressHandler: @escaping (Progress) -> Void
     ) async throws {
         // Connect and authenticate
         try await connect()
-        
+
         // Calculate total size for Progress
         let totalSize = try files.reduce(0) { (result, uploadable) -> Int64 in
             switch uploadable {
-            case .file(let url, _):
+            case .file(let url, _, _):
                 let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
                 return result + (attributes[.size] as? Int64 ?? 0)
-            case .data(let data, _):
+            case .data(let data, _, _):
                 return result + Int64(data.count)
             }
         }
-        
+
         let progress = self.progress ?? Progress(totalUnitCount: totalSize)
         progressHandler(progress)
-        
+
         for uploadable in files {
             if isCancelled {
                 throw FTPError.cancelled
             }
-            
+
             switch uploadable {
-            case .file(let url, let remoteFileName):
-                try await uploadFile(url: url, remoteFileName: remoteFileName, progress: progress, progressHandler: progressHandler)
-            case .data(let data, let remoteFileName):
-                try await uploadData(data: data, remoteFileName: remoteFileName, progress: progress, progressHandler: progressHandler)
+            case .file(let url, let remoteFileName, let transferType):
+                try await uploadFile(url: url, remoteFileName: remoteFileName, transferType: transferType, progress: progress, progressHandler: progressHandler)
+            case .data(let data, let remoteFileName, let transferType):
+                try await uploadData(data: data, remoteFileName: remoteFileName, transferType: transferType, progress: progress, progressHandler: progressHandler)
             }
         }
-        
+
         // Close control connection
         controlConnection?.cancel()
     }
-    
+
     private func connect() async throws {
         let parameters = NWParameters.tcp
         let endpoint = NWEndpoint.Host(credentials.host)
         let port = NWEndpoint.Port(rawValue: credentials.port)!
         controlConnection = NWConnection(host: endpoint, port: port, using: parameters)
-        
+
         try await withSafeStateHandler { completion in
             controlConnection?.stateUpdateHandler = { state in
                 switch state {
@@ -140,24 +140,24 @@ public class FTPClient {
             }
             controlConnection?.start(queue: .global())
         }
-        
+
         // Read the initial server response
         _ = try await readResponse()
-        
+
         // Send USER command
         try await sendCommand("USER \(credentials.username)")
         let userResponse = try await readResponse()
         guard userResponse.starts(with: "331") else {
             throw FTPError.authenticationFailed("Username not accepted: \(userResponse)")
         }
-        
+
         // Send PASS command
         try await sendCommand("PASS \(credentials.password)")
         let passResponse = try await readResponse()
         guard passResponse.starts(with: "230") else {
             throw FTPError.authenticationFailed("Password not accepted: \(passResponse)")
         }
-        
+
         // Change directory to remotePath
         try await sendCommand("CWD \(remotePath)")
         let cwdResponse = try await readResponse()
@@ -165,7 +165,7 @@ public class FTPClient {
             throw FTPError.other("Failed to change to remote directory: \(cwdResponse)")
         }
     }
-    
+
     private func sendCommand(_ command: String) async throws {
         guard let connection = controlConnection else {
             throw FTPError.connectionFailed("No control connection available.")
@@ -174,7 +174,7 @@ public class FTPClient {
         guard let data = commandWithCRLF.data(using: .utf8) else {
             throw FTPError.other("Failed to encode command.")
         }
-        
+
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             connection.send(content: data, completion: .contentProcessed({ error in
                 if let error = error {
@@ -185,12 +185,12 @@ public class FTPClient {
             }))
         }
     }
-    
+
     private func readResponse() async throws -> String {
         guard let connection = controlConnection else {
             throw FTPError.connectionFailed("No control connection available.")
         }
-        
+
         var completeResponse = ""
         while true {
             let partialResponse: String = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<String, Error>) in
@@ -214,10 +214,11 @@ public class FTPClient {
         }
         return completeResponse
     }
-    
+
     private func uploadFile(
         url: URL,
         remoteFileName: String,
+        transferType: FTPTransferType,
         progress: Progress,
         progressHandler: @escaping (Progress) -> Void
     ) async throws {
@@ -225,17 +226,19 @@ public class FTPClient {
         defer {
             try? fileHandle.close()
         }
-        
+
         // Enter passive mode
         let dataConnection = try await enterPassiveModeAndOpenDataConnection()
-        
+
+        try await setTransferType(transferType: transferType);
+
         // Send STOR command
         try await sendCommand("STOR \(remoteFileName)")
         let storResponse = try await readResponse()
         guard storResponse.starts(with: "150") else {
             throw FTPError.transferFailed("Failed to initiate file transfer: \(storResponse)")
         }
-        
+
         // Send file data
         //let bufferSize = 1024 * 1024 // 1MB buffer
         while true {
@@ -243,7 +246,7 @@ public class FTPClient {
                 dataConnection.cancel()
                 throw FTPError.cancelled
             }
-            
+
             if #available(macOS 10.15.4, *) {
                 let data = try fileHandle.read(upToCount: bufferSize)
                 if let data = data, !data.isEmpty {
@@ -257,52 +260,55 @@ public class FTPClient {
                 fatalError("SwiftFTPClient requires macOS 10.15.4 or later.")
             }
         }
-        
+
         // Close data connection
         dataConnection.cancel()
-        
+
         // Read server response
         let transferResponse = try await readResponse()
         guard transferResponse.starts(with: "226") else {
             throw FTPError.transferFailed("File transfer failed: \(transferResponse)")
         }
     }
-    
+
     private func uploadData(
         data: Data,
         remoteFileName: String,
+        transferType: FTPTransferType,
         progress: Progress,
         progressHandler: @escaping (Progress) -> Void
     ) async throws {
         // Enter passive mode
         let dataConnection = try await enterPassiveModeAndOpenDataConnection()
-        
+
+        try await setTransferType(transferType: transferType);
+
         // Send STOR command
         try await sendCommand("STOR \(remoteFileName)")
         let storResponse = try await readResponse()
         guard storResponse.starts(with: "150") else {
             throw FTPError.transferFailed("Failed to initiate data transfer: \(storResponse)")
         }
-        
+
         // Send data
         try await sendData(data: data, over: dataConnection)
         progress.completedUnitCount += Int64(data.count)
         progressHandler(progress)
-        
+
         // Close data connection
         dataConnection.cancel()
-        
+
         // Read server response
         let transferResponse = try await readResponse()
         guard transferResponse.starts(with: "226") else {
             throw FTPError.transferFailed("Data transfer failed: \(transferResponse)")
         }
     }
-    
+
     private func enterPassiveModeAndOpenDataConnection() async throws -> NWConnection {
         try await sendCommand("PASV")
         let pasvResponse = try await readResponse()
-        
+
         // Parse PASV response
         let pattern = "\\((.*?)\\)"
         let regex = try NSRegularExpression(pattern: pattern)
@@ -317,9 +323,9 @@ public class FTPClient {
         }
         let host = "\(numbers[0]).\(numbers[1]).\(numbers[2]).\(numbers[3])"
         let port = (numbers[4] << 8) + numbers[5]
-        
+
         let dataConnection = NWConnection(host: NWEndpoint.Host(host), port: NWEndpoint.Port(rawValue: port)!, using: .tcp)
-        
+
         try await withSafeStateHandler { completion in
             dataConnection.stateUpdateHandler = { state in
                 switch state {
@@ -335,10 +341,10 @@ public class FTPClient {
             }
             dataConnection.start(queue: .global())
         }
-        
+
         return dataConnection
     }
-    
+
     private func sendData(data: Data, over connection: NWConnection) async throws {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             connection.send(content: data, completion: .contentProcessed({ error in
@@ -350,7 +356,7 @@ public class FTPClient {
             }))
         }
     }
-    
+
     /// Verifies the connection to the FTP server.
     /// This method attempts to connect to the server, authenticate, and then disconnect.
     /// - Returns: A boolean indicating whether the connection was successful.
@@ -364,15 +370,15 @@ public class FTPClient {
             throw error
         }
     }
-    
+
     private func disconnect() async {
         controlConnection?.cancel()
         controlConnection = nil
     }
-    
+
     private actor SafeCompletionHandler<T> {
         private var hasCompleted = false
-        
+
         func complete(with result: Result<T, Error>, continuation: CheckedContinuation<T, Error>) {
             guard !hasCompleted else { return }
             hasCompleted = true
@@ -388,6 +394,20 @@ public class FTPClient {
                     await safeHandler.complete(with: result, continuation: continuation)
                 }
             }
+        }
+    }
+
+    private func setTransferType(transferType: FTPTransferType) async throws {
+        switch transferType {
+        case .binary:
+            try await sendCommand("TYPE I");
+        case .ascii:
+            try await sendCommand("TYPE A");
+        }
+
+        let response = try await readResponse();
+        guard response.starts(with: "200") else {
+            throw FTPError.transferTypeFailed("Failed to set the transfer type: \(response)");
         }
     }
 }
